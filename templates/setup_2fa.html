@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Set up authenticator app</h2>
+<p>1. Install Google Authenticator or Microsoft Authenticator on your phone.</p>
+<p>2. Scan this QR code:</p>
+<img src="data:image/png;base64,{{ qr }}" alt="QR code" style="width:200px;background:white;padding:8px;border-radius:6px;">
+<p>Can't scan? Type this key in the app: <code>{{ secret }}</code></p>
+<p>3. Enter the 6-digit code from the app:</p>
+<form method="POST">
+  <input type="text" name="code" maxlength="6" inputmode="numeric" required>
+  <button type="submit">Enable</button>
+</form>
+<p><a href="{{ url_for('dashboard') }}">Cancel</a></p>
+{% endblock %}

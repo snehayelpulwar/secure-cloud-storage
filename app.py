@@ -1,5 +1,7 @@
+import base64
 import hashlib
 import hmac
+import io
 import os
 import re
 import secrets
@@ -8,6 +10,8 @@ import time
 from functools import wraps
 
 import bcrypt
+import pyotp
+import qrcode
 from dotenv import load_dotenv
 from flask import (Flask, render_template, request, redirect,
                    url_for, session, flash, g)
@@ -24,7 +28,7 @@ app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 DATABASE = "users.db"
-OTP_VALID_SECONDS = 300   # 5 minutes
+OTP_VALID_SECONDS = 300
 OTP_MAX_TRIES = 5
 serializer = URLSafeTimedSerializer(app.secret_key)
 
@@ -42,7 +46,6 @@ def read_token(token, purpose, max_age):
 
 
 def send_email(to, subject, body):
-    # TEMPORARY: prints in the terminal. Real email comes later.
     print("\n----- EMAIL (test mode) -----")
     print("To:", to)
     print("Subject:", subject)
@@ -57,14 +60,13 @@ def strong_password(password):
             and re.search(r"\d", password))
 
 
-# ---------- OTP helpers ----------
+# ---------- Email OTP helpers ----------
 def hash_otp(code):
-    # HMAC with the secret key, so the code can't be guessed from the database
     return hmac.new(app.secret_key.encode(), code.encode(), hashlib.sha256).hexdigest()
 
 
 def create_otp(user_id, email):
-    code = f"{secrets.randbelow(1000000):06d}"   # secure random 6 digits
+    code = f"{secrets.randbelow(1000000):06d}"
     db = get_db()
     db.execute("DELETE FROM otp_codes WHERE user_id = ?", (user_id,))
     db.execute(
@@ -112,6 +114,14 @@ def init_db():
             attempts INTEGER NOT NULL DEFAULT 0
         )
     """)
+    # Upgrade old databases: add the authenticator columns if missing
+    cols = [row[1] for row in db.execute("PRAGMA table_info(users)")]
+    if "totp_secret" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
+    if "totp_enabled" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0")
+    if "totp_attempts" not in cols:
+        db.execute("ALTER TABLE users ADD COLUMN totp_attempts INTEGER NOT NULL DEFAULT 0")
     db.commit()
     db.close()
 
@@ -125,6 +135,13 @@ def login_required(view):
             return redirect(url_for("login"))
         return view(*args, **kwargs)
     return wrapped
+
+
+def finish_login(user):
+    session.clear()
+    session["user_id"] = user["id"]
+    session["email"] = user["email"]
+    session["role"] = user["role"]
 
 
 # ---------- Routes ----------
@@ -157,12 +174,10 @@ def register():
                     (email, hashed.decode("utf-8")),
                 )
                 db.commit()
-
                 token = make_token(email, "verify")
                 link = url_for("verify_email", token=token, _external=True)
                 send_email(email, "Verify your account",
                            f"Click to verify (valid 24 hours): {link}")
-
                 flash("Account created. Check your email to verify.", "success")
                 return redirect(url_for("login"))
             except sqlite3.IntegrityError:
@@ -190,7 +205,8 @@ def login():
         email = request.form.get("email", "").strip().lower()
         password = request.form.get("password", "")
 
-        user = get_db().execute(
+        db = get_db()
+        user = db.execute(
             "SELECT * FROM users WHERE email = ?", (email,)
         ).fetchone()
 
@@ -201,9 +217,16 @@ def login():
                 flash("Please verify your email first.", "error")
                 return render_template("login.html")
 
-            # Password OK -> now ask for the OTP (not logged in yet)
+            # Password OK -> second step (not logged in yet)
             session.clear()
             session["pending_user_id"] = user["id"]
+
+            if user["totp_enabled"]:
+                db.execute("UPDATE users SET totp_attempts = 0 WHERE id = ?",
+                           (user["id"],))
+                db.commit()
+                return redirect(url_for("totp"))
+
             create_otp(user["id"], user["email"])
             flash("A 6-digit code was sent to your email.", "success")
             return redirect(url_for("otp"))
@@ -246,10 +269,7 @@ def otp():
             ).fetchone()
             db.execute("DELETE FROM otp_codes WHERE user_id = ?", (user_id,))
             db.commit()
-            session.clear()
-            session["user_id"] = user["id"]
-            session["email"] = user["email"]
-            session["role"] = user["role"]
+            finish_login(user)
             return redirect(url_for("dashboard"))
 
         db.execute("UPDATE otp_codes SET attempts = attempts + 1 WHERE user_id = ?",
@@ -258,6 +278,76 @@ def otp():
         flash("Wrong code. Try again.", "error")
 
     return render_template("otp.html")
+
+
+@app.route("/totp", methods=["GET", "POST"])
+def totp():
+    user_id = session.get("pending_user_id")
+    if not user_id:
+        return redirect(url_for("login"))
+
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user or not user["totp_enabled"]:
+        session.clear()
+        return redirect(url_for("login"))
+
+    if request.method == "POST":
+        if user["totp_attempts"] >= OTP_MAX_TRIES:
+            session.clear()
+            flash("Too many wrong codes. Please log in again.", "error")
+            return redirect(url_for("login"))
+
+        code = request.form.get("code", "").strip()
+        if pyotp.TOTP(user["totp_secret"]).verify(code, valid_window=1):
+            db.execute("UPDATE users SET totp_attempts = 0 WHERE id = ?", (user_id,))
+            db.commit()
+            finish_login(user)
+            return redirect(url_for("dashboard"))
+
+        db.execute("UPDATE users SET totp_attempts = totp_attempts + 1 WHERE id = ?",
+                   (user_id,))
+        db.commit()
+        flash("Wrong code. Try again.", "error")
+
+    return render_template("totp.html")
+
+
+@app.route("/setup-2fa", methods=["GET", "POST"])
+@login_required
+def setup_2fa():
+    db = get_db()
+    user = db.execute("SELECT * FROM users WHERE id = ?",
+                      (session["user_id"],)).fetchone()
+
+    if user["totp_enabled"]:
+        flash("Authenticator app is already enabled.", "success")
+        return redirect(url_for("dashboard"))
+
+    secret = user["totp_secret"]
+    if not secret:
+        secret = pyotp.random_base32()
+        db.execute("UPDATE users SET totp_secret = ? WHERE id = ?",
+                   (secret, user["id"]))
+        db.commit()
+
+    if request.method == "POST":
+        code = request.form.get("code", "").strip()
+        if pyotp.TOTP(secret).verify(code, valid_window=1):
+            db.execute("UPDATE users SET totp_enabled = 1 WHERE id = ?",
+                       (user["id"],))
+            db.commit()
+            flash("Authenticator app enabled.", "success")
+            return redirect(url_for("dashboard"))
+        flash("Wrong code. Scan the QR again and retry.", "error")
+
+    uri = pyotp.TOTP(secret).provisioning_uri(
+        name=user["email"], issuer_name="Secure Cloud Storage")
+    buffer = io.BytesIO()
+    qrcode.make(uri).save(buffer, format="PNG")
+    qr = base64.b64encode(buffer.getvalue()).decode("ascii")
+
+    return render_template("setup_2fa.html", qr=qr, secret=secret)
 
 
 @app.route("/forgot", methods=["GET", "POST"])
@@ -304,7 +394,9 @@ def reset_password(token):
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    return render_template("dashboard.html")
+    user = get_db().execute("SELECT totp_enabled FROM users WHERE id = ?",
+                            (session["user_id"],)).fetchone()
+    return render_template("dashboard.html", totp_enabled=user["totp_enabled"])
 
 
 @app.route("/logout")
