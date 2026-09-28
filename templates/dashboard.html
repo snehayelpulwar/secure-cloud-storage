@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block content %}
+<h2>Dashboard</h2>
+<p>Welcome, <strong>{{ session['email'] }}</strong> (role: {{ session['role'] }})</p>
+<p>File upload will be added in a later step.</p>
+<a href="{{ url_for('logout') }}">Log out</a>
+{% endblock %}
