@@ -7,15 +7,19 @@ import re
 import secrets
 import sqlite3
 import time
+import uuid
 from functools import wraps
 
 import bcrypt
 import pyotp
 import qrcode
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
-from flask import (Flask, render_template, request, redirect,
-                   url_for, session, flash, g)
+from flask import (Flask, render_template, request, redirect, url_for,
+                   session, flash, g, send_file, abort)
 from itsdangerous import URLSafeTimedSerializer, BadSignature, SignatureExpired
+from werkzeug.utils import secure_filename
 
 load_dotenv()
 
@@ -24,8 +28,22 @@ app.secret_key = os.getenv("SECRET_KEY")
 if not app.secret_key:
     raise RuntimeError("SECRET_KEY is missing in .env")
 
+_file_key = os.getenv("FILE_KEY")
+if not _file_key:
+    raise RuntimeError("FILE_KEY is missing in .env")
+FILE_KEY = base64.urlsafe_b64decode(_file_key)
+if len(FILE_KEY) != 32:
+    raise RuntimeError("FILE_KEY must be 32 bytes (AES-256)")
+aesgcm = AESGCM(FILE_KEY)
+
 app.config["SESSION_COOKIE_HTTPONLY"] = True
 app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
+
+MAX_FILE_MB = 10
+app.config["MAX_CONTENT_LENGTH"] = (MAX_FILE_MB + 1) * 1024 * 1024
+ALLOWED_EXT = {"txt", "pdf", "png", "jpg", "jpeg", "docx", "xlsx", "pptx", "zip", "csv"}
+STORAGE_DIR = "storage"
+os.makedirs(STORAGE_DIR, exist_ok=True)
 
 DATABASE = "users.db"
 OTP_VALID_SECONDS = 300
@@ -114,7 +132,16 @@ def init_db():
             attempts INTEGER NOT NULL DEFAULT 0
         )
     """)
-    # Upgrade old databases: add the authenticator columns if missing
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            original_name TEXT NOT NULL,
+            stored_name TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     cols = [row[1] for row in db.execute("PRAGMA table_info(users)")]
     if "totp_secret" not in cols:
         db.execute("ALTER TABLE users ADD COLUMN totp_secret TEXT")
@@ -142,6 +169,12 @@ def finish_login(user):
     session["user_id"] = user["id"]
     session["email"] = user["email"]
     session["role"] = user["role"]
+
+
+@app.errorhandler(413)
+def too_large(error):
+    flash(f"File too large. Maximum is {MAX_FILE_MB} MB.", "error")
+    return redirect(url_for("dashboard"))
 
 
 # ---------- Routes ----------
@@ -217,7 +250,6 @@ def login():
                 flash("Please verify your email first.", "error")
                 return render_template("login.html")
 
-            # Password OK -> second step (not logged in yet)
             session.clear()
             session["pending_user_id"] = user["id"]
 
@@ -391,12 +423,101 @@ def reset_password(token):
     return render_template("reset.html")
 
 
+# ---------- Files ----------
 @app.route("/dashboard")
 @login_required
 def dashboard():
-    user = get_db().execute("SELECT totp_enabled FROM users WHERE id = ?",
-                            (session["user_id"],)).fetchone()
-    return render_template("dashboard.html", totp_enabled=user["totp_enabled"])
+    db = get_db()
+    user = db.execute("SELECT totp_enabled FROM users WHERE id = ?",
+                      (session["user_id"],)).fetchone()
+    files = db.execute(
+        "SELECT * FROM files WHERE user_id = ? ORDER BY id DESC",
+        (session["user_id"],)).fetchall()
+    return render_template("dashboard.html",
+                           totp_enabled=user["totp_enabled"],
+                           files=files, max_mb=MAX_FILE_MB)
+
+
+@app.route("/upload", methods=["POST"])
+@login_required
+def upload():
+    file = request.files.get("file")
+    if not file or file.filename == "":
+        flash("Choose a file first.", "error")
+        return redirect(url_for("dashboard"))
+
+    name = secure_filename(file.filename)
+    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+    if ext not in ALLOWED_EXT:
+        flash("File type not allowed.", "error")
+        return redirect(url_for("dashboard"))
+
+    data = file.read()
+    if len(data) == 0:
+        flash("The file is empty.", "error")
+        return redirect(url_for("dashboard"))
+    if len(data) > MAX_FILE_MB * 1024 * 1024:
+        flash(f"File too large. Maximum is {MAX_FILE_MB} MB.", "error")
+        return redirect(url_for("dashboard"))
+
+    # Encrypt: a fresh random nonce for every file, stored before the ciphertext
+    nonce = os.urandom(12)
+    encrypted = nonce + aesgcm.encrypt(nonce, data, None)
+
+    stored_name = uuid.uuid4().hex   # random name, the user's filename never touches the disk
+    with open(os.path.join(STORAGE_DIR, stored_name), "wb") as f:
+        f.write(encrypted)
+
+    db = get_db()
+    db.execute(
+        "INSERT INTO files (user_id, original_name, stored_name, size) "
+        "VALUES (?, ?, ?, ?)",
+        (session["user_id"], name, stored_name, len(data)))
+    db.commit()
+    flash("File encrypted and uploaded.", "success")
+    return redirect(url_for("dashboard"))
+
+
+def get_own_file(file_id):
+    # user_id check: users can only reach their own files
+    row = get_db().execute(
+        "SELECT * FROM files WHERE id = ? AND user_id = ?",
+        (file_id, session["user_id"])).fetchone()
+    if not row:
+        abort(404)
+    return row
+
+
+@app.route("/download/<int:file_id>")
+@login_required
+def download(file_id):
+    row = get_own_file(file_id)
+    path = os.path.join(STORAGE_DIR, row["stored_name"])
+    if not os.path.exists(path):
+        abort(404)
+    with open(path, "rb") as f:
+        blob = f.read()
+    try:
+        data = aesgcm.decrypt(blob[:12], blob[12:], None)
+    except InvalidTag:
+        flash("File is damaged or was changed.", "error")
+        return redirect(url_for("dashboard"))
+    return send_file(io.BytesIO(data), as_attachment=True,
+                     download_name=row["original_name"])
+
+
+@app.route("/delete/<int:file_id>", methods=["POST"])
+@login_required
+def delete(file_id):
+    row = get_own_file(file_id)
+    path = os.path.join(STORAGE_DIR, row["stored_name"])
+    if os.path.exists(path):
+        os.remove(path)
+    db = get_db()
+    db.execute("DELETE FROM files WHERE id = ?", (row["id"],))
+    db.commit()
+    flash("File deleted.", "success")
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/logout")

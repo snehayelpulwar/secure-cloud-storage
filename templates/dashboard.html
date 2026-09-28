@@ -7,6 +7,28 @@
 {% else %}
   <p><a href="{{ url_for('setup_2fa') }}">Set up authenticator app (recommended)</a></p>
 {% endif %}
-<p>File upload will be added in a later step.</p>
-<a href="{{ url_for('logout') }}">Log out</a>
+
+<h3>Upload a file</h3>
+<form method="POST" action="{{ url_for('upload') }}" enctype="multipart/form-data">
+  <input type="file" name="file" required>
+  <button type="submit">Encrypt and upload</button>
+</form>
+<p style="font-size:12px;">Max {{ max_mb }} MB. Allowed: txt, pdf, png, jpg, docx, xlsx, pptx, zip, csv.</p>
+
+<h3>Your files</h3>
+{% if files %}
+  {% for f in files %}
+    <div style="margin:8px 0;padding:8px;border:1px solid #30363d;border-radius:6px;">
+      {{ f['original_name'] }} ({{ (f['size'] / 1024)|round(1) }} KB)<br>
+      <a href="{{ url_for('download', file_id=f['id']) }}">Download</a>
+      <form method="POST" action="{{ url_for('delete', file_id=f['id']) }}" style="display:inline;">
+        <button type="submit" style="width:auto;padding:4px 10px;background:#b62324;">Delete</button>
+      </form>
+    </div>
+  {% endfor %}
+{% else %}
+  <p>No files yet.</p>
+{% endif %}
+
+<p><a href="{{ url_for('logout') }}">Log out</a></p>
 {% endblock %}
