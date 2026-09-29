@@ -13,8 +13,10 @@ A Flask web app for storing files securely. Built to practice real security feat
 - [x] OTP email MFA and authenticator app (QR) MFA
 - [x] AES-256 file encryption before storage
 - [x] File upload validation and size limits
-- [ ] Admin/user roles, file versioning, activity logs
-
+- [x] Admin/user roles, activity logs
+- [x] CSRF protection on all forms
+- [x] Login rate limiting (lockout after 5 failed attempts)
+- [ ] file versioning, 
 ## Tech Stack
 
 Python, Flask, SQLite, bcrypt, cryptography, pyotp
