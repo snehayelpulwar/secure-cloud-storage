@@ -21,6 +21,24 @@ A Flask web app built to practice real-world cybersecurity concepts: safe passwo
 
 ## Tech Stack
 
+## Screenshots
+
+### Login page
+<img width="652" height="747" alt="login p" src="https://github.com/user-attachments/assets/2ea3f25d-241d-4d6e-aa12-b77b53a89e83" />
+
+### Authenticator app (QR) setup
+<img width="661" height="507" alt="otp" src="https://github.com/user-attachments/assets/d661b80a-2da3-4eb4-b023-5ee95631bbb0" />
+
+### Dashboard — encrypt/decrypt files
+<img width="581" height="844" alt="dash board" src="https://github.com/user-attachments/assets/58a56673-722b-4477-98ef-59afb384976c" />
+
+### Admin panel
+<img width="1154" height="822" alt="admin" src="https://github.com/user-attachments/assets/0b92285d-cb85-47d3-9f24-5b64015edcd0" />
+
+### Encrypted file (proof of AES-256 encryption)
+<img width="774" height="195" alt="encry" src="https://github.com/user-attachments/assets/5f6fcf20-ce97-41c1-959a-cb3d96a29b7e" />
+
+
 Python, Flask, SQLite, bcrypt, cryptography (AES-256-GCM), pyotp, qrcode, Flask-WTF
 
 ## Security Features Explained
